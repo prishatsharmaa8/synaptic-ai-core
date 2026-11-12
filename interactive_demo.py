@@ -103,7 +103,7 @@ def launch_gradio_app():
         description="Interact with the trained Post-Transformer Dual-Memory Plastic Network for instant macro & calorie prediction."
     )
 
-    demo.launch(share=True)
+    demo.launch(share=False, inbrowser=True, server_port=7860)
 
 
 if __name__ == "__main__":
