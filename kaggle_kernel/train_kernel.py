@@ -175,10 +175,17 @@ class MacroVisionDMPNet(nn.Module):
     """
     def __init__(self, d_model: int = 256, n_heads: int = 4, n_layers: int = 2, d_ff: int = 512):
         super().__init__()
-        # Pretrained visual feature extractor
-        backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        # Pretrained visual feature extractor with offline fallback
+        try:
+            backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+            print("Loaded official pretrained EfficientNet weights.")
+        except Exception as e:
+            print(f"Network restriction detected ({e}). Initializing feature backbone locally.")
+            backbone = models.efficientnet_b0(weights=None)
+
         self.feature_extractor = backbone.features # outputs [B, 1280, 7, 7]
         self.feature_proj = nn.Linear(1280, d_model)
+
 
         self.blocks = nn.ModuleList([
             SynapticDualBlock(d_model, n_heads, d_ff) for _ in range(n_layers)
