@@ -1,13 +1,13 @@
 {
-  "id": "prishatsharmaa0/macro-vision-dmpnet",
+  "id": "prishatsharmaa0/macro-vision-dmpnet-training",
   "title": "Macro Vision DMPNet Training",
   "code_file": "train_kernel.py",
   "language": "python",
   "kernel_type": "script",
-  "is_private": "true",
-  "enable_gpu": "true",
-  "enable_tpu": "false",
-  "enable_internet": "true",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
   "dataset_sources": [
     "gillesokhin/nutrition5k-dataset"
   ],
