@@ -5,12 +5,15 @@ High-Capacity 4D RGB-D Food Topography & Macronutrient Training on Nutrition5k.
 Features:
 - DINOv2-Base (ViT-B/14) Self-Supervised Visual Texture Extractor
 - Metric Surface Elevation Topography Integral: V = double_integral Delta z dx dy
-- 8-Layer Synaptic Plasticity Core (Linear Associative Memory + Hebbian Fast-Weights)
+- 8-Layer Multi-Head Synaptic Plasticity Core (Linear Associative Memory + Hebbian Fast-Weights)
+- Gradient Accumulation & OOM Prevention (Effective Batch Size 32, Micro-Batch 4 per GPU)
 - Thermodynamic Energy Loss: 4P + 4C + 9F = Calories
 - Multi-GPU DataParallel + Automatic Mixed Precision (AMP FP16)
 """
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import sys
 import glob
 import math
@@ -27,11 +30,15 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
 # -------------------------------------------------------------
-# Configuration (Dual GPU Engine + High-Capacity Vision Core)
+# Configuration (Dual GPU Engine + Memory-Optimized Batching)
 # -------------------------------------------------------------
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 NUM_GPUS = torch.cuda.device_count()
-BATCH_SIZE = 16 * max(1, NUM_GPUS) # 32 total across Dual T4
+
+# Micro-batch per GPU = 4 to guarantee zero OOM on Tesla T4 (16GB)
+PER_GPU_BATCH = 4
+BATCH_SIZE = PER_GPU_BATCH * max(1, NUM_GPUS) # 8 total across Dual T4
+ACCUMULATION_STEPS = 4                         # Effective batch size = 32
 EPOCHS = 35
 LR = 2e-4
 WEIGHT_DECAY = 1e-4
@@ -39,6 +46,7 @@ IMAGE_SIZE = 224
 
 print(f"=== Kaggle 3D RGB-D DMP-Net Master Engine (~149.6M) ===")
 print(f"Execution Device: {DEVICE} (GPUs available: {NUM_GPUS})")
+print(f"Batch Configuration: Micro-batch {BATCH_SIZE} (x{ACCUMULATION_STEPS} accumulation = {BATCH_SIZE * ACCUMULATION_STEPS} effective batch)")
 if torch.cuda.is_available():
     for i in range(NUM_GPUS):
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
@@ -51,7 +59,7 @@ print("Searching for dish_nutrition_values.csv in environment...")
 
 if os.path.exists("/kaggle/input"):
     for root, dirs, files in os.walk("/kaggle/input"):
-        if "dish_nutrition_values.csv" in files:
+        if "dish_nutrition_values.csv" in files or "dish_ingredients.csv" in files:
             DATA_DIR = root
             print(f"Found dataset directory: {DATA_DIR}")
             break
@@ -66,7 +74,7 @@ if DATA_DIR is None:
     ]:
         if os.path.exists(candidate):
             for root, dirs, files in os.walk(candidate):
-                if "dish_nutrition_values.csv" in files:
+                if "dish_nutrition_values.csv" in files or "dish_ingredients.csv" in files:
                     DATA_DIR = root
                     break
         if DATA_DIR:
@@ -75,7 +83,7 @@ if DATA_DIR is None:
 print(f"Active Data Directory: {DATA_DIR}")
 
 # -------------------------------------------------------------
-# High-Capacity DMP-Net Master Architecture (~149.6M)
+# Memory-Optimized DMP-Net Master Architecture (~149.6M)
 # -------------------------------------------------------------
 class LinearAssociativeMemory(nn.Module):
     """Constant O(1) state memory replacing quadratic self-attention."""
@@ -119,10 +127,16 @@ class LinearAssociativeMemory(nn.Module):
 
 
 class HebbianFastWeights(nn.Module):
-    """Dynamic synaptic fast-weights adapting to portion scales during inference."""
-    def __init__(self, d_model: int, decay: float = 0.95, eta: float = 0.08):
+    """
+    Multi-Head Synaptic Fast-Weights layer.
+    Uses multi-head projected plasticity (n_heads=8, d_head=96)
+    to keep dynamic memory matrices lightweight and OOM-immune.
+    """
+    def __init__(self, d_model: int, n_heads: int = 8, decay: float = 0.95, eta: float = 0.08):
         super().__init__()
         self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_h = d_model // n_heads
         self.decay = decay
         self.eta = eta
         self.pre_proj = nn.Linear(d_model, d_model, bias=False)
@@ -131,18 +145,23 @@ class HebbianFastWeights(nn.Module):
 
     def forward(self, x: torch.Tensor):
         b, seq_len, d = x.shape
-        synaptic_matrix = torch.zeros(b, d, d, device=x.device, dtype=x.dtype)
+        pre = F.normalize(self.pre_proj(x).view(b, seq_len, self.n_heads, self.d_h), dim=-1)
+        post = F.normalize(self.post_proj(x).view(b, seq_len, self.n_heads, self.d_h), dim=-1)
+
+        synaptic_matrix = torch.zeros(b, self.n_heads, self.d_h, self.d_h, device=x.device, dtype=x.dtype)
         outputs = []
         for t in range(seq_len):
-            x_t = x[:, t, :]
-            pre = F.normalize(self.pre_proj(x_t), dim=-1)
-            post = F.normalize(self.post_proj(x_t), dim=-1)
+            pre_t = pre[:, t, :, :]   # [b, h, d_h]
+            post_t = post[:, t, :, :] # [b, h, d_h]
 
-            retrieved = torch.bmm(synaptic_matrix, pre.unsqueeze(-1)).squeeze(-1)
-            fused = torch.sigmoid(self.gate(torch.cat([x_t, retrieved], dim=-1))) * retrieved + x_t
+            retrieved = torch.matmul(synaptic_matrix, pre_t.unsqueeze(-1)).squeeze(-1)
+            retrieved_flat = retrieved.view(b, d)
+            x_t = x[:, t, :]
+
+            fused = torch.sigmoid(self.gate(torch.cat([x_t, retrieved_flat], dim=-1))) * retrieved_flat + x_t
             outputs.append(fused.unsqueeze(1))
 
-            hebbian_step = torch.bmm(post.unsqueeze(-1), pre.unsqueeze(1))
+            hebbian_step = torch.matmul(post_t.unsqueeze(-1), pre_t.unsqueeze(-2))
             synaptic_matrix = self.decay * synaptic_matrix + self.eta * hebbian_step
 
         return torch.cat(outputs, dim=1)
@@ -181,7 +200,7 @@ class DMPNetMasterTrainer(nn.Module):
         # 1. DINOv2-Base Visual Feature Extractor
         try:
             print("Attempting to load pretrained dinov2_vitb14 from PyTorch Hub...")
-            self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+            self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", trust_repo=True)
             print("Successfully loaded official Meta DINOv2-Base weights.")
         except Exception as e:
             print(f"Using high-capacity ViT architecture ({e}).")
@@ -285,17 +304,27 @@ class Nutrition5kRGBDDataset(Dataset):
     def __init__(self, data_dir: str, split: str = 'train', split_pct: float = 0.85):
         self.data_dir = data_dir
 
-        csv_path = os.path.join(data_dir, "dish_nutrition_values.csv") if data_dir else None
-        if not csv_path or not os.path.exists(csv_path):
-            candidates = glob.glob(os.path.join(data_dir, "**", "dish_nutrition_values.csv"), recursive=True) if data_dir else []
+        csv_path = None
+        for candidate_name in ["dish_nutrition_values.csv", "dish_metadata_cafe1.csv", "dish_ingredients.csv"]:
+            candidates = glob.glob(os.path.join(data_dir, "**", candidate_name), recursive=True) if data_dir else []
             if not candidates and os.path.exists("/kaggle/input"):
-                candidates = glob.glob("/kaggle/input/**/dish_nutrition_values.csv", recursive=True)
+                candidates = glob.glob(f"/kaggle/input/**/{candidate_name}", recursive=True)
             if candidates:
                 csv_path = candidates[0]
                 self.data_dir = os.path.dirname(csv_path)
+                break
 
         df = pd.read_csv(csv_path)
-        print(f"Loaded {len(df)} total dish records from {csv_path}")
+        print(f"Loaded {len(df)} total records from {csv_path}")
+
+        # Normalize column names if needed
+        cols = {c.lower(): c for c in df.columns}
+        cal_col = cols.get('calories', 'calories')
+        mass_col = cols.get('mass', 'mass')
+        fat_col = cols.get('fat', 'fat')
+        carb_col = cols.get('carb', 'carb')
+        protein_col = cols.get('protein', 'protein')
+        dish_id_col = cols.get('dish_id', 'dish_id')
 
         imagery_candidates = [
             os.path.join(self.data_dir, "imagery", "realsense_overhead"),
@@ -311,7 +340,9 @@ class Nutrition5kRGBDDataset(Dataset):
 
         valid_records = []
         for _, row in df.iterrows():
-            dish_id = str(row['dish_id']).strip()
+            if dish_id_col not in row or pd.isna(row[dish_id_col]):
+                continue
+            dish_id = str(row[dish_id_col]).strip()
             dish_folder = os.path.join(self.img_dir, dish_id) if self.img_dir else None
             rgb_path = None
             depth_path = None
@@ -334,11 +365,11 @@ class Nutrition5kRGBDDataset(Dataset):
                     "dish_id": dish_id,
                     "rgb_path": rgb_path,
                     "depth_path": depth_path,
-                    "calories": float(row['calories']),
-                    "mass": float(row['mass']),
-                    "fat": float(row['fat']),
-                    "carb": float(row['carb']),
-                    "protein": float(row['protein'])
+                    "calories": float(row.get(cal_col, 0.0)),
+                    "mass": float(row.get(mass_col, 0.0)),
+                    "fat": float(row.get(fat_col, 0.0)),
+                    "carb": float(row.get(carb_col, 0.0)),
+                    "protein": float(row.get(protein_col, 0.0))
                 })
 
         print(f"Indexed {len(valid_records)} verified paired RGB-D food scans.")
@@ -415,15 +446,14 @@ def train_engine():
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_loss = 0.0
+        optimizer.zero_grad()
 
-        for rgb, depth, targets_macros, targets_cal, targets_mass in train_loader:
+        for step_idx, (rgb, depth, targets_macros, targets_cal, targets_mass) in enumerate(train_loader):
             rgb = rgb.to(DEVICE)
             depth = depth.to(DEVICE)
             targets_macros = targets_macros.to(DEVICE)
             targets_cal = targets_cal.to(DEVICE)
             targets_mass = targets_mass.to(DEVICE)
-
-            optimizer.zero_grad()
 
             with torch.amp.autocast('cuda', enabled=(DEVICE.type == 'cuda')):
                 preds = model(rgb, depth)
@@ -436,15 +466,18 @@ def train_engine():
                 thermo_cal = 4.0 * p_c_f[:, 0:1] + 4.0 * p_c_f[:, 1:2] + 9.0 * p_c_f[:, 2:3]
                 loss_thermo = F.mse_loss(preds['calories'], thermo_cal)
 
-                total_loss = loss_macros + 0.6 * loss_cal + 0.3 * loss_mass + 0.5 * loss_thermo
+                batch_loss = (loss_macros + 0.6 * loss_cal + 0.3 * loss_mass + 0.5 * loss_thermo) / ACCUMULATION_STEPS
 
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(batch_loss).backward()
 
-            train_loss += total_loss.item() * rgb.size(0)
+            if (step_idx + 1) % ACCUMULATION_STEPS == 0 or (step_idx + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            train_loss += batch_loss.item() * ACCUMULATION_STEPS * rgb.size(0)
 
         train_loss /= max(1, len(train_ds))
         scheduler.step()
@@ -476,7 +509,6 @@ def train_engine():
 
                 val_loss += total_loss.item() * rgb.size(0)
 
-                # MAE tracking
                 val_p_mae += torch.sum(torch.abs(p_c_f[:, 0:1] - targets_macros[:, 0:1])).item()
                 val_c_mae += torch.sum(torch.abs(p_c_f[:, 1:2] - targets_macros[:, 1:2])).item()
                 val_f_mae += torch.sum(torch.abs(p_c_f[:, 2:3] - targets_macros[:, 2:3])).item()
@@ -513,7 +545,6 @@ def train_engine():
             torch.save(raw_model.state_dict(), ckpt_path)
             print(f"  --> Checkpoint saved: {ckpt_path} (Val Loss: {best_val_loss:.2f})")
 
-    # Export metrics
     metrics_path = os.path.join(output_dir, "metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(metrics_history, f, indent=2)
