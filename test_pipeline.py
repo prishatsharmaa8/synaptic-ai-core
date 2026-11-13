@@ -7,21 +7,29 @@ Automated verification of:
 3. Physical 3D Volume to Mass translation: Mass = Volume * Density
 4. Cultural VLM dish and ingredient decomposition
 5. Gemini Coach metabolic guidance generation
+6. Depth-Anything-V2 3D surface elevation estimation
+7. Semantic Culinary Ontology graph decomposition (Auto-Ontology pattern)
+8. High-Capacity DMPNetDINOv2 Master Tier (~149.6M params)
 """
 
-import sys
 import unittest
 from PIL import Image
+import torch
 
 from curanova_food_db import CuranovaFoodDatabase, FOOD_DATABASE
+from curanova_ontology import CuranovaOntologyEngine
 from cultural_vlm_engine import CulturalVLMEngine
+from depth_anything_engine import DepthAnythingEngine
 from gemini_coach_service import GeminiCoachService
+from models.dmpnet_dinov2 import DMPNetDINOv2, count_parameters
 
 
 class TestCuranovaPipeline(unittest.TestCase):
     def setUp(self):
         self.db = CuranovaFoodDatabase()
+        self.ontology = CuranovaOntologyEngine()
         self.vlm = CulturalVLMEngine()
+        self.depth_engine = DepthAnythingEngine()
         self.coach = GeminiCoachService()
 
     def test_database_regional_dishes_exist(self):
@@ -109,6 +117,44 @@ class TestCuranovaPipeline(unittest.TestCase):
         self.assertIn("macros_per_100g", analysis)
         self.assertEqual(analysis["primary_dish"], "Himachali Siddu")
         self.assertEqual(analysis["density_g_cm3"], 1.10)
+
+    def test_depth_anything_surface_elevation(self):
+        """Verifies that DepthAnythingEngine outputs a valid 3D surface elevation grid."""
+        dummy_img = Image.new("RGB", (224, 224), color=(210, 180, 130))
+        depth_tensor = self.depth_engine.estimate_surface_depth(dummy_img, target_size=(224, 224))
+
+        self.assertEqual(depth_tensor.shape, (1, 1, 224, 224))
+        self.assertGreaterEqual(float(depth_tensor.min()), 0.0)
+        self.assertLessEqual(float(depth_tensor.max()), 1.0)
+        self.assertGreater(float(depth_tensor.mean()), 0.05)
+
+    def test_semantic_culinary_ontology(self):
+        """Verifies hierarchical dish decomposition into subcomponents."""
+        node = self.ontology.get_node("himachali siddu")
+        self.assertIsNotNone(node)
+        self.assertEqual(len(node.components), 3) # Casing, Stuffing, Ghee dip
+
+        decomp = node.explain_decomposition(250.0)
+        self.assertEqual(decomp["dish"], "Himachali Siddu")
+        self.assertEqual(len(decomp["subcomponents"]), 3)
+        self.assertAlmostEqual(decomp["effective_density"], 1.06, places=2)
+
+    def test_dmpnet_dinov2_master_tier(self):
+        """Verifies high-capacity DMP-Net Master Tier (~149.6M params) and forward pass."""
+        model = DMPNetDINOv2(tier="master")
+        params = count_parameters(model)
+        self.assertGreater(params, 100_000_000, "Master tier must exceed 100M parameters")
+        self.assertLess(params, 200_000_000, "Master tier should be around ~135M-150M parameters")
+
+        # Test forward pass with fused 3D elevation
+        rgb = torch.randn(1, 3, 224, 224)
+        depth = torch.rand(1, 1, 224, 224)
+        out = model(rgb, depth)
+
+        self.assertEqual(out["macros"].shape, (1, 3))
+        self.assertEqual(out["calories"].shape, (1, 1))
+        self.assertEqual(out["mass"].shape, (1, 1))
+        self.assertEqual(out["spatial_volume_cm3"].shape, (1, 1))
 
     def test_gemini_coach_guidance(self):
         """Verifies metabolic coaching generation for both sweets and balanced meals."""
