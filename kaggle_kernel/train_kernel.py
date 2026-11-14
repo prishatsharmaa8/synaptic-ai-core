@@ -159,9 +159,9 @@ class ParallelHebbianFastWeights(nn.Module):
     def forward(self, x: torch.Tensor):
         b, seq_len, d = x.shape
 
-        # Projected features: [b, n_heads, seq_len, d_h]
-        pre = F.normalize(self.pre_proj(x).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1)
-        post = F.normalize(self.post_proj(x).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1)
+        # Projected features with safe half-precision epsilon (eps=1e-5)
+        pre = F.normalize(self.pre_proj(x).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1, eps=1e-5)
+        post = F.normalize(self.post_proj(x).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1, eps=1e-5)
 
         # Cast to float32 for correlation accumulation
         orig_dtype = x.dtype
@@ -193,11 +193,13 @@ class SynapticDualBlock(nn.Module):
             nn.GELU(),
             nn.Linear(d_ff, d_model)
         )
+        # LayerScale parameter to prevent residual activation explosion across deep blocks
+        self.gamma = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x: torch.Tensor):
-        x = x + self.linear_attn(self.ln1(x))
-        x = x + self.plasticity(self.ln2(x))
-        x = x + self.ffn(self.ln3(x))
+        x = x + self.gamma * self.linear_attn(self.ln1(x))
+        x = x + self.gamma * self.plasticity(self.ln2(x))
+        x = x + self.gamma * self.ffn(self.ln3(x))
         return x
 
 
@@ -221,6 +223,11 @@ class DMPNetMasterTrainer(nn.Module):
                 self.backbone = self._build_local_vit(embed_dim=768, depth=12, num_heads=12)
         else:
             self.backbone = self._build_local_vit(embed_dim=768, depth=12, num_heads=12)
+
+        # Freeze pretrained DINOv2 backbone for rock-solid visual representations
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        print("DINOv2 backbone frozen to preserve pretrained visual features.")
 
         # 2. Surface Volume & Elevation Projections
         self.volume_mlp = nn.Sequential(
@@ -465,7 +472,8 @@ def train_engine():
         print(f"Deploying Distributed DataParallel across {NUM_GPUS} Tesla T4 GPUs...")
         model = nn.DataParallel(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
 
@@ -512,7 +520,7 @@ def train_engine():
 
             if (step_idx + 1) % ACCUMULATION_STEPS == 0 or (step_idx + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()

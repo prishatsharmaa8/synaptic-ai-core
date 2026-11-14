@@ -21,8 +21,8 @@ def run_numerical_stress_test():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Testing on Device: {device}")
 
-    model = DMPNetMasterTrainer(pretrained_backbone=False).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=2e-4, weight_decay=1e-4)
     criterion = nn.SmoothL1Loss(beta=1.0)
     use_cuda = (device.type == 'cuda')
     scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)

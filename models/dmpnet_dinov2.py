@@ -96,9 +96,9 @@ class ParallelHebbianFastWeights(nn.Module):
         b, seq_len, d = x.shape
         x_norm = self.norm(x)
 
-        # Projected features: [b, n_heads, seq_len, d_h]
-        pre = F.normalize(self.pre_proj(x_norm).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1)
-        post = F.normalize(self.post_proj(x_norm).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1)
+        # Projected features with safe half-precision epsilon (eps=1e-5)
+        pre = F.normalize(self.pre_proj(x_norm).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1, eps=1e-5)
+        post = F.normalize(self.post_proj(x_norm).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1, eps=1e-5)
 
         # Cast to float32 for correlation accumulation
         orig_dtype = x.dtype
@@ -130,11 +130,12 @@ class SynapticDualBlock(nn.Module):
             nn.GELU(),
             nn.Linear(d_ff, d_model)
         )
+        self.gamma = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x: torch.Tensor):
-        x = x + self.linear_attn(self.ln1(x))
-        x = x + self.plasticity(self.ln2(x))
-        x = x + self.ffn(self.ln3(x))
+        x = x + self.gamma * self.linear_attn(self.ln1(x))
+        x = x + self.gamma * self.plasticity(self.ln2(x))
+        x = x + self.gamma * self.ffn(self.ln3(x))
         return x
 
 
@@ -146,7 +147,7 @@ class DMPNetDINOv2(nn.Module):
     - 'master': DINOv2-Base (86M) + 8 Blocks (49M)  = ~149.6M Parameters
     - 'ultra':  DINOv2-Large (304M) + 12 Blocks (176M) = ~506.3M Parameters
     """
-    def __init__(self, tier: str = "master", pretrained_backbone: bool = False):
+    def __init__(self, tier: str = "master", pretrained_backbone: bool = False, freeze_backbone: bool = True):
         super().__init__()
         self.tier = tier.lower()
 
@@ -173,6 +174,10 @@ class DMPNetDINOv2(nn.Module):
                 self.backbone = self._build_local_vit(hub_name)
         else:
             self.backbone = self._build_local_vit(hub_name)
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
 
         # 2. Metric Surface Depth & Volume Integrator
         self.volume_mlp = nn.Sequential(
@@ -284,8 +289,10 @@ class DMPNetDINOv2(nn.Module):
         }
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
 
 
 if __name__ == "__main__":
