@@ -5,10 +5,12 @@ High-Capacity 4D RGB-D Food Topography & Macronutrient Training on Nutrition5k.
 Features:
 - DINOv2-Base (ViT-B/14) Self-Supervised Visual Texture Extractor
 - Metric Surface Elevation Topography Integral: V = double_integral Delta z dx dy
-- 8-Layer Multi-Head Synaptic Plasticity Core (Linear Associative Memory + Hebbian Fast-Weights)
-- Gradient Accumulation & OOM Prevention (Effective Batch Size 32, Micro-Batch 4 per GPU)
-- Thermodynamic Energy Loss: 4P + 4C + 9F = Calories
-- Multi-GPU DataParallel + Automatic Mixed Precision (AMP FP16)
+- 8-Layer Multi-Head Synaptic Plasticity Core (Vectorized Linear Memory + Hebbian Fast-Weights)
+- Zero Sequential Python Loops: Parallel O(N) Tensor Contractions on Tensor Cores
+- FP32 Numerical Accumulation: Fully Immune to FP16 65,504 Overflow
+- SmoothL1 Thermodynamic Invariant Loss: 4P + 4C + 9F = Calories
+- Data Sanitization: Automatic rejection/cleanup of missing or non-finite records
+- Multi-GPU DataParallel + Automatic Mixed Precision (AMP)
 """
 
 import os
@@ -30,7 +32,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
 # -------------------------------------------------------------
-# Configuration (Dual GPU Engine + Memory-Optimized Batching)
+# Engine Config (Dual GPU Engine + Memory-Optimized Batching)
 # -------------------------------------------------------------
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 NUM_GPUS = torch.cuda.device_count()
@@ -44,9 +46,9 @@ LR = 2e-4
 WEIGHT_DECAY = 1e-4
 IMAGE_SIZE = 224
 
-print(f"=== Kaggle 3D RGB-D DMP-Net Master Engine (~149.6M) ===")
+print("=== Kaggle 3D RGB-D DMP-Net Master Engine (~149.6M) ===")
 print(f"Execution Device: {DEVICE} (GPUs available: {NUM_GPUS})")
-print(f"Batch Configuration: Micro-batch {BATCH_SIZE} (x{ACCUMULATION_STEPS} accumulation = {BATCH_SIZE * ACCUMULATION_STEPS} effective batch)")
+print(f"Batch Config: Micro-batch {BATCH_SIZE} (x{ACCUMULATION_STEPS} accumulation = {BATCH_SIZE * ACCUMULATION_STEPS} effective batch)")
 if torch.cuda.is_available():
     for i in range(NUM_GPUS):
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
@@ -83,10 +85,14 @@ if DATA_DIR is None:
 print(f"Active Data Directory: {DATA_DIR}")
 
 # -------------------------------------------------------------
-# Memory-Optimized DMP-Net Master Architecture (~149.6M)
+# Parallel & Numerically Stable DMP-Net Master Architecture
 # -------------------------------------------------------------
-class LinearAssociativeMemory(nn.Module):
-    """Constant O(1) state memory replacing quadratic self-attention."""
+class ParallelLinearAssociativeMemory(nn.Module):
+    """
+    Vectorized O(N) Linear Attention.
+    Computes bidirectional associative memory across all visual tokens in parallel.
+    Maintains FP32 state accumulation to prevent FP16 half-precision overflow.
+    """
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.d_model = d_model
@@ -98,82 +104,89 @@ class LinearAssociativeMemory(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-    def feature_map(self, x: torch.Tensor) -> torch.Tensor:
-        return F.elu(x) + 1.0
-
     def forward(self, x: torch.Tensor):
         b, seq_len, _ = x.shape
+
+        # Multi-head projection: [b, n_heads, seq_len, d_k]
         q = self.q_proj(x).view(b, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         k = self.k_proj(x).view(b, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         v = self.v_proj(x).view(b, seq_len, self.n_heads, self.d_k).transpose(1, 2)
 
-        q = self.feature_map(q)
-        k = self.feature_map(k)
+        # Positive feature mapping: elu(x) + 1.0
+        q = F.elu(q) + 1.0
+        k = F.elu(k) + 1.0
 
-        state = torch.zeros(b, self.n_heads, self.d_k, self.d_k, device=x.device, dtype=x.dtype)
-        outputs = []
-        for t in range(seq_len):
-            q_t = q[:, :, t:t+1, :]
-            k_t = k[:, :, t:t+1, :]
-            v_t = v[:, :, t:t+1, :]
+        # Cast to float32 for associative accumulation to guarantee zero overflow
+        orig_dtype = x.dtype
+        q_32 = q.float()
+        k_32 = k.float()
+        v_32 = v.float()
 
-            state = state + torch.matmul(k_t.transpose(-1, -2), v_t)
-            out_t = torch.matmul(q_t, state)
-            outputs.append(out_t)
+        # Parallel outer product accumulation: [b, h, d_k, d_k]
+        kv = torch.matmul(k_32.transpose(-1, -2), v_32)
 
-        y = torch.cat(outputs, dim=2)
+        # Retrieve: Q * (K^T V) -> [b, h, seq_len, d_k]
+        y_32 = torch.matmul(q_32, kv)
+
+        # Normalization factor: Q * sum(K)
+        k_sum = torch.sum(k_32, dim=-2, keepdim=True) # [b, h, 1, d_k]
+        normalizer = torch.matmul(q_32, k_sum.transpose(-1, -2)).clamp(min=1e-5)
+
+        y_32 = y_32 / normalizer
+        y = y_32.to(orig_dtype)
+
         y = y.transpose(1, 2).contiguous().view(b, seq_len, self.d_model)
         return self.out_proj(y)
 
 
-class HebbianFastWeights(nn.Module):
+class ParallelHebbianFastWeights(nn.Module):
     """
-    Multi-Head Synaptic Fast-Weights layer.
-    Uses multi-head projected plasticity (n_heads=8, d_head=96)
-    to keep dynamic memory matrices lightweight and OOM-immune.
+    Vectorized Multi-Head Synaptic Fast-Weights layer.
+    Computes dynamic correlation matrices across all visual patches in parallel,
+    normalized by sequence length to maintain strict bounded stability.
     """
-    def __init__(self, d_model: int, n_heads: int = 8, decay: float = 0.95, eta: float = 0.08):
+    def __init__(self, d_model: int, n_heads: int = 8, eta: float = 0.08):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_h = d_model // n_heads
-        self.decay = decay
         self.eta = eta
+
         self.pre_proj = nn.Linear(d_model, d_model, bias=False)
         self.post_proj = nn.Linear(d_model, d_model, bias=False)
         self.gate = nn.Linear(d_model * 2, d_model)
 
     def forward(self, x: torch.Tensor):
         b, seq_len, d = x.shape
-        pre = F.normalize(self.pre_proj(x).view(b, seq_len, self.n_heads, self.d_h), dim=-1)
-        post = F.normalize(self.post_proj(x).view(b, seq_len, self.n_heads, self.d_h), dim=-1)
 
-        synaptic_matrix = torch.zeros(b, self.n_heads, self.d_h, self.d_h, device=x.device, dtype=x.dtype)
-        outputs = []
-        for t in range(seq_len):
-            pre_t = pre[:, t, :, :]   # [b, h, d_h]
-            post_t = post[:, t, :, :] # [b, h, d_h]
+        # Projected features: [b, n_heads, seq_len, d_h]
+        pre = F.normalize(self.pre_proj(x).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1)
+        post = F.normalize(self.post_proj(x).view(b, seq_len, self.n_heads, self.d_h).transpose(1, 2), dim=-1)
 
-            retrieved = torch.matmul(synaptic_matrix, pre_t.unsqueeze(-1)).squeeze(-1)
-            retrieved_flat = retrieved.view(b, d)
-            x_t = x[:, t, :]
+        # Cast to float32 for correlation accumulation
+        orig_dtype = x.dtype
+        pre_32 = pre.float()
+        post_32 = post.float()
 
-            fused = torch.sigmoid(self.gate(torch.cat([x_t, retrieved_flat], dim=-1))) * retrieved_flat + x_t
-            outputs.append(fused.unsqueeze(1))
+        # Parallel Hebbian correlation matrix: [b, h, d_h, d_h]
+        synaptic_matrix = torch.matmul(post_32.transpose(-1, -2), pre_32) / math.sqrt(seq_len)
 
-            hebbian_step = torch.matmul(post_t.unsqueeze(-1), pre_t.unsqueeze(-2))
-            synaptic_matrix = self.decay * synaptic_matrix + self.eta * hebbian_step
+        # Retrieve: [b, h, seq_len, d_h]
+        retrieved_32 = torch.matmul(pre_32, synaptic_matrix.transpose(-1, -2))
+        retrieved = retrieved_32.to(orig_dtype).transpose(1, 2).contiguous().view(b, seq_len, d)
 
-        return torch.cat(outputs, dim=1)
+        # Gated integration
+        gated = torch.sigmoid(self.gate(torch.cat([x, retrieved], dim=-1))) * retrieved * self.eta
+        return gated
 
 
 class SynapticDualBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.linear_attn = LinearAssociativeMemory(d_model, n_heads)
+        self.linear_attn = ParallelLinearAssociativeMemory(d_model, n_heads)
         self.ln2 = nn.LayerNorm(d_model)
-        self.plasticity = HebbianFastWeights(d_model)
+        self.plasticity = ParallelHebbianFastWeights(d_model)
         self.ln3 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -193,17 +206,20 @@ class DMPNetMasterTrainer(nn.Module):
     DMP-Net Master Tier Architecture (~149.6 Million Parameters).
     Combines DINOv2 ViT-B/14 (86M) + 8-Layer Synaptic Plastic Core (49M) + Spatial Depth Fusion.
     """
-    def __init__(self, d_model: int = 768, n_heads: int = 12, n_layers: int = 8, d_ff: int = 2048):
+    def __init__(self, d_model: int = 768, n_heads: int = 12, n_layers: int = 8, d_ff: int = 2048, pretrained_backbone: bool = True):
         super().__init__()
         self.d_model = d_model
 
         # 1. DINOv2-Base Visual Feature Extractor
-        try:
-            print("Attempting to load pretrained dinov2_vitb14 from PyTorch Hub...")
-            self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", trust_repo=True)
-            print("Successfully loaded official Meta DINOv2-Base weights.")
-        except Exception as e:
-            print(f"Using high-capacity ViT architecture ({e}).")
+        if pretrained_backbone:
+            try:
+                print("Attempting to load pretrained dinov2_vitb14 from PyTorch Hub...")
+                self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", trust_repo=True)
+                print("Successfully loaded official Meta DINOv2-Base weights.")
+            except Exception as e:
+                print(f"Using high-capacity ViT architecture ({e}).")
+                self.backbone = self._build_local_vit(embed_dim=768, depth=12, num_heads=12)
+        else:
             self.backbone = self._build_local_vit(embed_dim=768, depth=12, num_heads=12)
 
         # 2. Surface Volume & Elevation Projections
@@ -222,21 +238,21 @@ class DMPNetMasterTrainer(nn.Module):
 
         # 4. Thermodynamic Continuous Regression Heads
         self.macro_head = nn.Sequential(
-            nn.Linear(d_model, 256),
+            nn.Linear(d_model, 384),
             nn.GELU(),
-            nn.Linear(256, 3),
+            nn.Linear(384, 3),
             nn.ReLU()
         )
         self.calorie_head = nn.Sequential(
-            nn.Linear(d_model, 256),
+            nn.Linear(d_model, 384),
             nn.GELU(),
-            nn.Linear(256, 1),
+            nn.Linear(384, 1),
             nn.ReLU()
         )
         self.mass_head = nn.Sequential(
-            nn.Linear(d_model, 256),
+            nn.Linear(d_model, 384),
             nn.GELU(),
-            nn.Linear(256, 1),
+            nn.Linear(384, 1),
             nn.ReLU()
         )
 
@@ -297,9 +313,20 @@ class DMPNetMasterTrainer(nn.Module):
             "volume": spatial_vol
         }
 
+
 # -------------------------------------------------------------
-# 4D RGB-D Dataset Loader
+# 4D RGB-D Dataset Loader (With Comprehensive Data Sanitization)
 # -------------------------------------------------------------
+def sanitize_float(val, default=0.0):
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return max(0.0, f)
+    except (ValueError, TypeError):
+        return default
+
+
 class Nutrition5kRGBDDataset(Dataset):
     def __init__(self, data_dir: str, split: str = 'train', split_pct: float = 0.85):
         self.data_dir = data_dir
@@ -317,7 +344,6 @@ class Nutrition5kRGBDDataset(Dataset):
         df = pd.read_csv(csv_path)
         print(f"Loaded {len(df)} total records from {csv_path}")
 
-        # Normalize column names if needed
         cols = {c.lower(): c for c in df.columns}
         cal_col = cols.get('calories', 'calories')
         mass_col = cols.get('mass', 'mass')
@@ -361,15 +387,21 @@ class Nutrition5kRGBDDataset(Dataset):
                         break
 
             if rgb_path and os.path.exists(rgb_path):
+                c = sanitize_float(row.get(cal_col, 0.0))
+                m = sanitize_float(row.get(mass_col, 0.0))
+                fa = sanitize_float(row.get(fat_col, 0.0))
+                ca = sanitize_float(row.get(carb_col, 0.0))
+                pr = sanitize_float(row.get(protein_col, 0.0))
+
                 valid_records.append({
                     "dish_id": dish_id,
                     "rgb_path": rgb_path,
                     "depth_path": depth_path,
-                    "calories": float(row.get(cal_col, 0.0)),
-                    "mass": float(row.get(mass_col, 0.0)),
-                    "fat": float(row.get(fat_col, 0.0)),
-                    "carb": float(row.get(carb_col, 0.0)),
-                    "protein": float(row.get(protein_col, 0.0))
+                    "calories": c,
+                    "mass": m,
+                    "fat": fa,
+                    "carb": ca,
+                    "protein": pr
                 })
 
         print(f"Indexed {len(valid_records)} verified paired RGB-D food scans.")
@@ -411,6 +443,7 @@ class Nutrition5kRGBDDataset(Dataset):
 
         return rgb_tensor, depth_tensor, macros, calories, mass
 
+
 # -------------------------------------------------------------
 # Multi-GPU Accelerated Training Engine
 # -------------------------------------------------------------
@@ -436,7 +469,7 @@ def train_engine():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
 
-    criterion = nn.SmoothL1Loss()
+    criterion = nn.SmoothL1Loss(beta=1.0)
     best_val_loss = float('inf')
     metrics_history = []
 
@@ -464,15 +497,22 @@ def train_engine():
                 # Thermodynamic Conservation Invariant: 4P + 4C + 9F = Calories
                 p_c_f = preds['macros']
                 thermo_cal = 4.0 * p_c_f[:, 0:1] + 4.0 * p_c_f[:, 1:2] + 9.0 * p_c_f[:, 2:3]
-                loss_thermo = F.mse_loss(preds['calories'], thermo_cal)
+                # SmoothL1Loss guarantees linear gradient scaling without quadratic FP16 overflow
+                loss_thermo = criterion(preds['calories'], thermo_cal)
 
                 batch_loss = (loss_macros + 0.6 * loss_cal + 0.3 * loss_mass + 0.5 * loss_thermo) / ACCUMULATION_STEPS
+
+            # Numerical safety barrier: bypass batch if non-finite
+            if not torch.isfinite(batch_loss):
+                print(f"Warning: Non-finite loss encountered at epoch {epoch}, step {step_idx}. Skipping update.")
+                optimizer.zero_grad()
+                continue
 
             scaler.scale(batch_loss).backward()
 
             if (step_idx + 1) % ACCUMULATION_STEPS == 0 or (step_idx + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -503,7 +543,7 @@ def train_engine():
 
                     p_c_f = preds['macros']
                     thermo_cal = 4.0 * p_c_f[:, 0:1] + 4.0 * p_c_f[:, 1:2] + 9.0 * p_c_f[:, 2:3]
-                    loss_thermo = F.mse_loss(preds['calories'], thermo_cal)
+                    loss_thermo = criterion(preds['calories'], thermo_cal)
 
                     total_loss = loss_macros + 0.6 * loss_cal + 0.3 * loss_mass + 0.5 * loss_thermo
 
